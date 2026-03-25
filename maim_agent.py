@@ -10,7 +10,6 @@ import google.generativeai as genai
 from supabase import create_client, Client
 
 # --- CONFIGURAZIONE ---
-# Assicurati che questi nomi corrispondano esattamente ai Secrets su GitHub
 GMAIL_USER = os.getenv('GMAIL_USER')
 GMAIL_PASS = os.getenv('GMAIL_PASSWORD')
 GEMINI_KEY = os.getenv('GEMINI_API_KEY')
@@ -18,92 +17,88 @@ SUPABASE_URL = os.getenv('SUPABASE_URL')
 SUPABASE_KEY = os.getenv('SUPABASE_KEY')
 RECIPIENT_ME = "g.emili@maimgroup.com"
 
+# Verifica iniziale dei segreti
+if not all([GMAIL_USER, GMAIL_PASS, GEMINI_KEY, SUPABASE_URL, SUPABASE_KEY]):
+    print("!!! ERRORE CRITICO: Uno o più Secrets mancano su GitHub Settings.")
+
 # Inizializzazione Client
-# Se i segreti mancano, il programma darà un errore chiaro qui
-if not all([SUPABASE_URL, SUPABASE_KEY, GEMINI_KEY]):
-    print("ERRORE: Secrets non configurati correttamente su GitHub.")
-
-supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
-genai.configure(api_key=GEMINI_KEY)
-
-# Usiamo gemini-1.5-flash per massima compatibilità e velocità
-model = genai.GenerativeModel('gemini-1.5-flash')
+try:
+    supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
+    genai.configure(api_key=GEMINI_KEY)
+    model = genai.GenerativeModel('gemini-1.5-flash')
+except Exception as e:
+    print(f"!!! ERRORE INIZIALIZZAZIONE: {e}")
 
 def get_gmail_connection():
+    print(f"Tentativo connessione IMAP per: {GMAIL_USER}")
     mail = imaplib.IMAP4_SSL("imap.gmail.com")
     mail.login(GMAIL_USER, GMAIL_PASS)
     return mail
 
 def fetch_new_emails():
-    conn = get_gmail_connection()
-    conn.select("inbox")
-    # Cerchiamo solo le mail NON LETTE
-    status, messages = conn.search(None, 'UNSEEN')
-    texts = []
-    if status == 'OK':
-        for num in messages[0].split():
-            _, data = conn.fetch(num, '(RFC822)')
-            msg = email.message_from_bytes(data[0][1])
-            body = ""
-            if msg.is_multipart():
-                for part in msg.walk():
-                    if part.get_content_type() == "text/plain":
-                        payload = part.get_payload(decode=True)
-                        if payload:
-                            body += payload.decode(errors='ignore')
-            else:
-                payload = msg.get_payload(decode=True)
-                if payload:
-                    body = payload.decode(errors='ignore')
-            
-            if body.strip():
-                texts.append(body)
-            
-            # Segna come letta dopo il prelievo
-            conn.store(num, '+FLAGS', '\\Seen')
-    conn.logout()
-    return texts
+    try:
+        conn = get_gmail_connection()
+        conn.select("inbox")
+        # Cerchiamo solo le mail NON LETTE
+        status, messages = conn.search(None, 'UNSEEN')
+        texts = []
+        if status == 'OK':
+            email_ids = messages[0].split()
+            print(f"Mail non lette trovate: {len(email_ids)}")
+            for num in email_ids:
+                _, data = conn.fetch(num, '(RFC822)')
+                msg = email.message_from_bytes(data[0][1])
+                body = ""
+                if msg.is_multipart():
+                    for part in msg.walk():
+                        if part.get_content_type() == "text/plain":
+                            payload = part.get_payload(decode=True)
+                            if payload:
+                                body += payload.decode(errors='ignore')
+                else:
+                    payload = msg.get_payload(decode=True)
+                    if payload:
+                        body = payload.decode(errors='ignore')
+                
+                if body.strip():
+                    texts.append(body)
+                
+                # Segna come letta
+                conn.store(num, '+FLAGS', '\\Seen')
+        conn.logout()
+        return texts
+    except Exception as e:
+        print(f"!!! ERRORE GMAIL (fetch): {e}")
+        return []
 
 def extract_and_deduplicate(raw_texts):
-    # Recuperiamo gli ultimi appuntamenti per aiutare l'IA a non duplicare
+    print("Invio dati a Gemini per estrazione...")
     try:
-        res_db = supabase.table("appointments").select("*").order("data", desc=True).limit(30).execute()
+        res_db = supabase.table("appointments").select("*").order("data", desc=True).limit(20).execute()
         existing = res_db.data
     except Exception as e:
-        print(f"Nota: Impossibile leggere DB, procedo senza storico: {e}")
+        print(f"Nota: Impossibile leggere storico DB (procedo): {e}")
         existing = []
 
     prompt = f"""
-    Sei l'assistente di Maim Group. Analizza i testi delle email ed estrai esclusivamente gli appuntamenti (convegni, meeting, compleanni, lanci stampa).
+    Sei l'assistente di Maim Group. Analizza i testi ed estrai gli appuntamenti.
     CONFRONTA con questi già esistenti per evitare duplicati: {json.dumps(existing)}
-    
-    Restituisci solo un array JSON con questi campi:
-    - data (formato YYYY-MM-DD)
-    - ora (formato HH:MM o null)
-    - luogo (null o stringa)
-    - descrizione (usa icone WhatsApp e grassetti per i nomi propri)
-    - categoria (es. Evento, Comunicazione, Scadenza)
-
-    REGOLE:
-    1. Se l'appuntamento è già presente, ignoralo.
-    2. Restituisci SOLO il codice JSON, niente introduzioni.
-    
-    Testi da analizzare:
-    {chr(10).join(raw_texts)}
+    Restituisci solo un array JSON [{{ "data": "YYYY-MM-DD", "ora": "HH:MM", "luogo": "...", "descrizione": "...", "categoria": "..." }}]
+    Testi: {chr(10).join(raw_texts)}
     """
     
     try:
         response = model.generate_content(prompt)
-        # Pulizia rigorosa del JSON
         text_content = response.text.strip()
-        if "```json" in text_content:
-            text_content = text_content.split("```json")[1].split("```")[0].strip()
-        elif "```" in text_content:
-            text_content = text_content.split("```")[1].split("```")[0].strip()
+        # Pulizia blocchi di codice markdown
+        if "```" in text_content:
+            text_content = text_content.split("```")[1].replace("json", "").strip()
         
-        return json.loads(text_content)
+        data = json.loads(text_content)
+        print(f"Gemini ha estratto {len(data)} potenziali appuntamenti.")
+        return data
     except Exception as e:
-        print(f"Errore analisi IA: {e}")
+        print(f"!!! ERRORE IA/JSON: {e}")
         return []
 
 def send_mail(subject, content):
@@ -112,62 +107,53 @@ def send_mail(subject, content):
     msg['To'] = RECIPIENT_ME
     msg['Subject'] = subject
     msg.attach(MIMEText(content, 'plain'))
-    
     try:
         with smtplib.SMTP_SSL("smtp.gmail.com", 465) as server:
             server.login(GMAIL_USER, GMAIL_PASS)
             server.send_message(msg)
-        print(f"Mail inviata con successo: {subject}")
+        print("Report inviato via mail.")
     except Exception as e:
-        print(f"Errore invio mail: {e}")
+        print(f"!!! ERRORE INVIO MAIL: {e}")
 
 def format_for_wa(title, events):
-    if not events:
-        return f"*{title}*\n_Nessun impegno in archivio per questa data._\n\n"
-    
+    if not events: return f"*{title}*\n_Nessun impegno_\n\n"
     res = f"*{title}*\n\n"
-    # Ordiniamo per ora se disponibile
     for e in events:
-        ora = f" 🕒 {e['ora']}" if e.get('ora') else ""
-        luogo = f" 📍 {e['luogo']}" if e.get('luogo') else ""
+        ora = f" 🕒 {e.get('ora') or ''}"
+        luogo = f" 📍 {e.get('luogo') or ''}"
         res += f"• {e['descrizione']}{ora}{luogo}\n"
     return res + "\n"
 
 def main(mode):
-    print(f"Avvio modalità: {mode}")
+    print(f"--- START AGENT (Mode: {mode}) ---")
     
     if mode == "ingest":
         raw = fetch_new_emails()
         if raw:
             news = extract_and_deduplicate(raw)
-            if news and isinstance(news, list):
-                supabase.table("appointments").insert(news).execute()
-                print(f"Inseriti {len(news)} nuovi appuntamenti.")
+            if news:
+                print("Tentativo di scrittura su Supabase...")
+                try:
+                    res = supabase.table("appointments").insert(news).execute()
+                    print(f"Successo Supabase: {res}")
+                except Exception as e:
+                    print(f"!!! ERRORE SCRITTURA SUPABASE: {e}")
             else:
-                print("Nessun nuovo appuntamento rilevato.")
+                print("Nessun nuovo dato da inserire.")
         else:
-            print("Nessuna nuova mail da leggere.")
+            print("Nessuna mail 'Non Letta' trovata in Inbox.")
 
-    elif mode == "report_0700":
-        today = datetime.date.today().isoformat()
-        res = supabase.table("appointments").select("*").eq("data", today).execute()
-        content = format_for_wa(f"MAIM - APPUNTAMENTI DI OGGI ({today})", res.data)
-        send_mail(f"Maim - Appuntamenti di Oggi", content)
-
-    elif mode == "report_1900":
-        tmrw = (datetime.date.today() + datetime.timedelta(days=1)).isoformat()
-        res_t = supabase.table("appointments").select("*").eq("data", tmrw).execute()
+    elif mode == "report_0700" or mode == "report_1900":
+        target_date = datetime.date.today()
+        if mode == "report_1900":
+            target_date += datetime.timedelta(days=1)
         
-        # Recupero anche i prossimi 7 giorni
-        next_week = (datetime.date.today() + datetime.timedelta(days=7)).isoformat()
-        res_w = supabase.table("appointments").select("*").gt("data", tmrw).lte("data", next_week).order("data").execute()
-        
-        content = format_for_wa(f"MAIM - DOMANI ({tmrw})", res_t.data)
-        content += format_for_wa("PROSSIMI 7 GIORNI", res_w.data)
-        send_mail(f"Maim - Appuntamenti di Domani", content)
+        print(f"Generazione report per data: {target_date}")
+        res = supabase.table("appointments").select("*").eq("data", target_date.isoformat()).execute()
+        content = format_for_wa(f"MAIM AGENDA - {target_date}", res.data)
+        send_mail(f"Maim Agenda - {target_date}", content)
 
 if __name__ == "__main__":
     import sys
-    # Se non viene passato un argomento, di default fa ingestion
     run_mode = sys.argv[1] if len(sys.argv) > 1 else "ingest"
     main(run_mode)
