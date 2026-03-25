@@ -1,0 +1,27 @@
+name: Maim Agent Automation
+on:
+  schedule:
+    - cron: "*/15 * * * *" # Ogni 15 min
+    - cron: "0 6 * * *"    # 07:00 ITA
+    - cron: "0 18 * * *"   # 19:00 ITA
+  workflow_dispatch:
+jobs:
+  run:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.10'
+      - run: pip install -r requirements.txt
+      - env:
+          GMAIL_USER: ${{ secrets.GMAIL_USER }}
+          GMAIL_PASSWORD: ${{ secrets.GMAIL_PASSWORD }}
+          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_KEY: ${{ secrets.SUPABASE_KEY }}
+        run: |
+          H=$(date +%H)
+          if [ "$H" == "06" ]; then python maim_agent.py report_0700
+          elif [ "$H" == "18" ]; then python maim_agent.py report_1900
+          else python maim_agent.py ingest; fi
